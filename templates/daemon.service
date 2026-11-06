@@ -1,0 +1,13 @@
+[Unit]
+Description=Tailscale for isolated tailnet @NAME@
+Requires=tailnet-shell-@NAME@-netns.service
+After=tailnet-shell-@NAME@-netns.service
+PartOf=tailnet-shell-@NAME@-netns.service
+
+[Service]
+ExecStart=/usr/bin/ip netns exec tn-@NAME@ /usr/bin/tailscaled --state=/var/lib/tailnet-shell/@NAME@/tailscaled.state --socket=/run/tailnet-shell-@NAME@/tailscaled.sock --port=0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Install and remove named Tailscale network namespaces on Linux."""
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+SOURCE = Path(__file__).resolve().parent
+CONFIG = Path('/etc/tailnet-shell')
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+def name_type(value):
+    if not re.fullmatch(r'[a-z][a-z0-9-]{0,11}', value):
+        raise argparse.ArgumentTypeError('Use 1–12 lowercase letters, digits, or hyphens; start with a letter.')
+    return value
+
+
+def subnet_type(value):
+    try:
+        subnet = ipaddress.ip_network(value)
+        if subnet.version != 4 or subnet.prefixlen != 30:
+            raise ValueError('Expected an aligned IPv4 /30 subnet.')
+        if not any(subnet.subnet_of(ipaddress.ip_network(private)) for private in
+                   ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')):
+            raise ValueError('Use an RFC1918 private subnet.')
+        return str(subnet)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def dns_type(value):
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('Bootstrap DNS must be an IPv4 address.') from exc
+
+
+def suffix_type(value):
+    if len(value) > 253 or not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                                   for label in value.rstrip('.').split('.')):
+        raise argparse.ArgumentTypeError('Expected a DNS suffix such as example.ts.net.')
+    return value.rstrip('.')
+
+
+def rendered_files(args):
+    subnet = ipaddress.ip_network(args.subnet)
+    values = {'NAME': args.name, 'TOKEN': hashlib.sha256(args.name.encode()).hexdigest()[:8],
+              'GATEWAY': str(subnet[1]), 'ADDRESS': str(subnet[2])}
+    base = f'/etc/tailnet-shell/{args.name}'
+    files = {}
+    templates = {
+        'network.sh': (f'{base}/network.sh', 0o755),
+        'shell.sh': (f'/usr/local/bin/{args.name}-shell', 0o755),
+        'tailscale.sh': (f'/usr/local/bin/{args.name}-tailscale', 0o755),
+        'network.service': (f'/etc/systemd/system/tailnet-shell-{args.name}-netns.service', 0o644),
+        'daemon.service': (f'/etc/systemd/system/tailnet-shell-{args.name}.service', 0o644),
+    }
+    for template, (path, mode) in templates.items():
+        content = (SOURCE / 'templates' / template).read_text()
+        for key, value in values.items():
+            content = content.replace(f'@{key}@', value)
+        files[path] = (content, mode)
+    files[f'/etc/netns/tn-{args.name}/resolv.conf'] = (
+        ''.join(f'nameserver {dns}\n' for dns in args.bootstrap_dns), 0o644)
+    nss = Path('/etc/nsswitch.conf').read_text()
+    nss = re.sub(r'^hosts:.*$', 'hosts: files dns', nss, flags=re.M)
+    if not re.search(r'^hosts:', nss, re.M):
+        nss += '\nhosts: files dns\n'
+    files[f'/etc/netns/tn-{args.name}/nsswitch.conf'] = (nss, 0o644)
+    dns = 'nameserver 100.100.100.100\n'
+    if args.dns_suffix:
+        dns += f'search {args.dns_suffix}\n'
+    files[f'{base}/resolv.shell'] = (dns, 0o644)
+    files[f'{base}/instance.json'] = (json.dumps({
+        'format': 1, 'name': args.name, 'subnet': args.subnet,
+        'dns_suffix': args.dns_suffix, 'bootstrap_dns': args.bootstrap_dns,
+    }, indent=2) + '\n', 0o644)
+    return files
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise RuntimeError('Run this command with sudo.')
+
+
+def ensure_no_shells(namespace):
+    result = run('ip', 'netns', 'list', capture_output=True)
+    if namespace not in [line.split()[0] for line in result.stdout.splitlines()]:
+        return
+    pids = run('ip', 'netns', 'pids', namespace, capture_output=True).stdout.split()
+    active = []
+    for pid in pids:
+        try:
+            if Path(f'/proc/{pid}/comm').read_text().strip() != 'tailscaled':
+                active.append(pid)
+        except FileNotFoundError:
+            pass
+    if active:
+        raise RuntimeError(f'Exit all shells and stop applications in {namespace} first (PIDs: {", ".join(active)}).')
+
+
+def install(args):
+    require_root()
+    for tool in ('ip', 'iptables', 'tailscale', 'tailscaled', 'systemctl', 'runuser', 'mount', 'sudo', 'bash'):
+        if not shutil.which(tool):
+            raise RuntimeError(f'Missing dependency: {tool}')
+    if Path('/proc/sys/net/ipv4/ip_forward').read_text().strip() != '1':
+        raise RuntimeError('IPv4 forwarding is disabled. See README.md before enabling it.')
+    if not Path('/dev/net/tun').exists():
+        raise RuntimeError('/dev/net/tun is unavailable.')
+    files = rendered_files(args)
+    for path in files:
+        if os.path.lexists(path):
+            raise RuntimeError(f'Refusing to overwrite {path}. Uninstall an existing instance first.')
+    namespaces = run('ip', 'netns', 'list', capture_output=True).stdout
+    if f'tn-{args.name}' in [line.split()[0] for line in namespaces.splitlines()]:
+        raise RuntimeError('Namespace already exists.')
+    requested = ipaddress.ip_network(args.subnet)
+    routes = json.loads(run('ip', '-j', '-4', 'route', 'show', 'table', 'all', capture_output=True).stdout)
+    existing = [r['dst'] for r in routes if r.get('dst', 'default') != 'default']
+    for marker in CONFIG.glob('*/instance.json'):
+        existing.append(json.loads(marker.read_text())['subnet'])
+    for subnet in existing:
+        if requested.overlaps(ipaddress.ip_network(subnet, strict=False)):
+            raise RuntimeError(f'Subnet overlaps {subnet}; choose a different --subnet.')
+    state = Path(f'/var/lib/tailnet-shell/{args.name}')
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state.chmod(0o700)
+    for path, (content, mode) in files.items():
+        target = Path(path)
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        # Exclusive creation also protects against accidental overwrites.
+        with target.open('x') as stream:
+            stream.write(content)
+        target.chmod(mode)
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'enable', '--now', f'tailnet-shell-{args.name}.service')
+    print(f'Installed. Authenticate with:\n  {args.name}-tailscale up --accept-dns=false --hostname={os.uname().nodename}-{args.name}')
+
+
+def uninstall(args):
+    require_root()
+    base = CONFIG / args.name
+    marker = base / 'instance.json'
+    if not marker.exists():
+        raise RuntimeError(f'No managed instance named {args.name}. For the original installer use uninstall-legacy-work.')
+    metadata = json.loads(marker.read_text())
+    if metadata.get('format') != 1 or metadata.get('name') != args.name:
+        raise RuntimeError('Unrecognized instance metadata; refusing removal.')
+    ensure_no_shells(f'tn-{args.name}')
+    run('systemctl', 'disable', '--now', f'tailnet-shell-{args.name}.service')
+    run('systemctl', 'stop', f'tailnet-shell-{args.name}-netns.service')
+    # Also clean up after a previously failed or manually stopped service.
+    runtime = Path(f'/run/tailnet-shell-{args.name}')
+    runtime.mkdir(mode=0o755, exist_ok=True)
+    run('bash', str(base / 'network.sh'), 'stop')
+    for path in (Path(f'/usr/local/bin/{args.name}-shell'), Path(f'/usr/local/bin/{args.name}-tailscale'),
+                 Path(f'/etc/systemd/system/tailnet-shell-{args.name}.service'),
+                 Path(f'/etc/systemd/system/tailnet-shell-{args.name}-netns.service')):
+        path.unlink(missing_ok=True)
+    shutil.rmtree(base)
+    shutil.rmtree(f'/etc/netns/tn-{args.name}', ignore_errors=True)
+    shutil.rmtree(runtime, ignore_errors=True)
+    finish_removal(args, Path(f'/var/lib/tailnet-shell/{args.name}'))
+
+
+def legacy_files():
+    """Read the original installer's literal heredocs without executing it."""
+    source = (SOURCE / 'legacy/install-work-tailnet.sh').read_text()
+    files = {Path(path): content + '\n' for path, delimiter, content in re.findall(
+        r"cat >([^\s]+) <<'(SCRIPT|UNIT)'\n(.*?)\n\2", source, re.S)}
+    if len(files) != 5:
+        raise RuntimeError('The archived legacy installer is incomplete or modified.')
+    return files
+
+
+def uninstall_legacy(args):
+    require_root()
+    expected = legacy_files()
+    helper = Path('/usr/local/libexec/work-tailnet-netns')
+    for path, content in expected.items():
+        if not path.is_file() or path.read_text() != content:
+            raise RuntimeError(f'{path} is missing or differs from the original installer. Refusing automatic legacy removal.')
+    ensure_no_shells('ts-work')
+    run('systemctl', 'disable', '--now', 'tailscaled-work.service')
+    run('systemctl', 'stop', 'work-tailnet-netns.service')
+    run('bash', str(helper), 'stop')
+    for path in expected:
+        path.unlink()
+    for directory in ('/etc/netns/ts-work', '/etc/tailscale-work', '/run/tailscale-work'):
+        shutil.rmtree(directory, ignore_errors=True)
+    Path('/run/work-tailnet-uplink').unlink(missing_ok=True)
+    finish_removal(args, Path('/var/lib/tailscale-work'))
+    print('The archived installer is retained in this repository. /tmp/install-work-tailnet.sh can now be deleted.')
+
+
+def finish_removal(args, state):
+    run('systemctl', 'daemon-reload')
+    if args.purge_state:
+        shutil.rmtree(state, ignore_errors=True)
+        print(f'Removed configuration and local authentication state: {state}')
+    else:
+        print(f'Removed configuration. Authentication state preserved at {state}')
+    print('The host Tailscale service was left unchanged. Remove the device from the tailnet admin console if desired.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    for command in ('install', 'render'):
+        item = sub.add_parser(command, help='Install an instance' if command == 'install' else 'Preview generated files without root or network changes')
+        item.add_argument('name', type=name_type)
+        item.add_argument('--subnet', type=subnet_type, required=True)
+        item.add_argument('--dns-suffix', type=suffix_type)
+        item.add_argument('--bootstrap-dns', type=dns_type, nargs='+', default=['1.1.1.1', '9.9.9.9'])
+        if command == 'render':
+            item.add_argument('--output', type=Path, required=True)
+    item = sub.add_parser('uninstall', help='Remove a named instance')
+    item.add_argument('name', type=name_type)
+    item.add_argument('--purge-state', action='store_true', help='Also delete local Tailscale authentication state')
+    item = sub.add_parser('uninstall-legacy-work', help='Remove the original /tmp/install-work-tailnet.sh installation')
+    item.add_argument('--purge-state', action='store_true')
+    args = parser.parse_args()
+    try:
+        if args.command == 'install':
+            install(args)
+        elif args.command == 'uninstall':
+            uninstall(args)
+        elif args.command == 'uninstall-legacy-work':
+            uninstall_legacy(args)
+        else:
+            for path, (content, mode) in rendered_files(args).items():
+                target = args.output / path.lstrip('/')
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open('x') as stream:
+                    stream.write(content)
+                target.chmod(mode)
+            print(f'Preview written to {args.output}; nothing installed.')
+    except (RuntimeError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+        print(f'Error: {exc}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

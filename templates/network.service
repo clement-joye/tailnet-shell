@@ -1,0 +1,13 @@
+[Unit]
+Description=Network namespace for tailnet @NAME@
+Wants=network-online.target
+After=network-online.target docker.service
+Before=tailnet-shell-@NAME@.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=tailnet-shell-@NAME@
+RuntimeDirectoryMode=0755
+ExecStart=/etc/tailnet-shell/@NAME@/network.sh start
+ExecStopPost=/etc/tailnet-shell/@NAME@/network.sh stop
