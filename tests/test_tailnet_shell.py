@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -72,18 +73,33 @@ class TailnetShellTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Exit all shells'):
                 app.ensure_no_shells('tn-client')
 
-    def test_legacy_removal_matches_exact_original_artifacts(self):
-        files = app.legacy_files()
-        self.assertEqual(len(files), 5)
-        self.assertIn(Path('/usr/local/bin/work-shell'), files)
-        for path, content in files.items():
-            if content.startswith('#!/usr/bin/env bash'):
-                subprocess.run(['bash', '-n'], input=content, text=True, check=True)
-        with patch.object(app, 'legacy_files', return_value=files), \
-                patch.object(app, 'require_root'), patch.object(Path, 'is_file', return_value=True), \
-                patch.object(Path, 'read_text', return_value='modified'), patch.object(app, 'run') as run:
-            with self.assertRaisesRegex(RuntimeError, 'differs from the original'):
-                app.uninstall_legacy(argparse.Namespace(purge_state=False))
+    def test_legacy_layout_uses_the_supplied_instance_name(self):
+        for name in ('client', 'lab'):
+            with self.subTest(name=name):
+                paths = app.legacy_paths(name)
+                helper, network_unit, daemon_unit, shell, cli = paths
+                contents = {
+                    helper: f'ip netns del ts-{name}',
+                    network_unit: f'ExecStart={helper} start',
+                    daemon_unit: f'--state=/var/lib/tailscale-{name}/tailscaled.state',
+                    shell: f'ip netns exec ts-{name} bash',
+                    cli: f'--socket=/run/tailscale-{name}/tailscaled.sock',
+                }
+                metadata = SimpleNamespace(st_mode=0o100755, st_uid=0)
+                with patch.object(Path, 'lstat', return_value=metadata), \
+                        patch.object(Path, 'read_text', autospec=True, side_effect=lambda path: contents[path]):
+                    self.assertEqual(app.validate_legacy_files(name), paths)
+                with patch.object(Path, 'lstat', return_value=metadata), \
+                        patch.object(Path, 'read_text', return_value='unrelated file'):
+                    with self.assertRaisesRegex(RuntimeError, 'expected legacy layout'):
+                        app.validate_legacy_files(name)
+
+    def test_legacy_removal_refuses_untrusted_helpers_before_mutations(self):
+        metadata = SimpleNamespace(st_mode=0o100777, st_uid=1000)
+        with patch.object(app, 'require_root'), patch.object(Path, 'lstat', return_value=metadata), \
+                patch.object(app, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'root-owned'):
+                app.uninstall_legacy(argparse.Namespace(name='client', purge_state=False))
             run.assert_not_called()
 
     def test_authentication_state_is_deleted_only_when_requested(self):

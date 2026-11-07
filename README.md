@@ -88,27 +88,19 @@ sudo ./tailnet-shell uninstall client --purge-state
 
 Neither command deletes the device registration from the tailnet admin console. Local state deletion requires fresh authentication on reinstall. To delete retained state after an uninstall, remove the specific instance directory under `/var/lib/tailnet-shell` yourself.
 
-## Remove the original `/tmp/install-work-tailnet.sh` installation
+## Remove an older installation
 
-The original installer is archived under `legacy/` for reproducibility. Your existing installation can continue to run; creating this repository does not migrate it.
-
-Exit all `work-shell` sessions and stop their applications, then run:
+For instances created with the earlier installer layout, pass the instance name explicitly:
 
 ```bash
-sudo ./tailnet-shell uninstall-legacy-work
+sudo ./tailnet-shell uninstall-legacy client
 ```
 
-This removes `tailscaled-work.service`, `work-tailnet-netns.service`, the `ts-work` namespace, its firewall rules and virtual link, `/usr/local/bin/work-shell`, `/usr/local/bin/work-tailscale`, and their configuration/helper files. It checks the five installed scripts and units against the archived original before stopping anything. Modified or missing files require manual review.
+Use the name of your existing instance in place of `client`. Exit all of its shells and stop its applications first. This compatibility command recognizes the older `ts-NAME` namespace, `tailscaled-NAME.service`, `NAME-tailnet-netns.service`, and `NAME-shell` / `NAME-tailscale` launchers. It checks that installed scripts and units are regular, root-owned files with expected instance-specific layout markers before invoking their existing cleanup helper.
 
-State is preserved in `/var/lib/tailscale-work`. To remove authentication state as well, use `uninstall-legacy-work --purge-state` instead. The host daemon and its current Private account are left unchanged. The original device registration remains in the Work admin console until removed there.
+The command removes services, launchers, namespace configuration, and the virtual link and firewall rules handled by the existing cleanup helper. It preserves authentication state under `/var/lib/tailscale-NAME`, unless `--purge-state` is supplied. The host daemon is left unchanged.
 
-After successful removal, the temporary installer itself can be deleted:
-
-```bash
-rm -f /tmp/install-work-tailnet.sh
-```
-
-To replace the original setup with a generic instance named `work`, uninstall the legacy setup first, then install `work` using an unused subnet and its actual DNS suffix. Authenticate the new instance again; generic state storage is intentionally separate from legacy state.
+The compatibility command does not delete the original installer file; you can delete that file yourself after successful removal. To replace an older installation with the current layout, uninstall the older instance first and install the same or a different name using `install`. Authenticate the new instance again; its state storage is separate.
 
 ## Routing boundaries
 
@@ -125,4 +117,4 @@ Render installation files into a local directory without sudo or system changes:
 python3 -m unittest discover -s tests -v
 ```
 
-Tests validate input handling, generated shell syntax, separate instance resources, cleanup after partial startup, refusal to uninstall active shells, and legacy matching. Network commands in cleanup tests are mocked. The generic installer and removal commands require privileged integration testing; the original Work installation was confirmed working by its user.
+Tests validate input handling, generated shell syntax, separate instance resources, cleanup after partial startup, refusal to uninstall active shells, and validation of older installation layouts. Network commands in cleanup tests are mocked. The generic installer and removal commands require privileged integration testing; the earlier installation was confirmed working by its user.
