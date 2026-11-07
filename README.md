@@ -1,5 +1,7 @@
 # tailnet-shell
 
+Licensed under the [MIT License](LICENSE).
+
 Run shells on different Tailscale tailnets using Linux network namespaces. A normal terminal uses the host's tailnet; a named shell uses a separate Tailscale daemon and device identity. Works with Ghostty and other terminals, without application proxy settings.
 
 Each instance gets its own network namespace, virtual Ethernet link, IPv4 NAT rules, state directory, Unix control socket, systemd services, DNS configuration, and two launchers. Multiple named instances can run simultaneously.
