@@ -17,12 +17,14 @@ git clone https://github.com/clement-joye/tailnet-shell.git
 cd tailnet-shell
 ```
 
-Choose a name for your connection, such as `client`, and install it:
+Choose any short name for your connection, such as `work`, `lab`, or `vm1`. **`client` below is just an example—replace it with your chosen name throughout the commands.** Names must start with a lowercase letter and contain only lowercase letters, digits, or hyphens, up to 12 characters.
 
 ```bash
 sudo ./tailnet-shell install client
 client-tailscale up
 ```
+
+Your chosen name becomes the command prefix: if you install `work`, use `work-tailscale up` and `work-shell`; if you install `vm1`, use `vm1-tailscale up` and `vm1-shell`.
 
 Open the login URL and sign in to the tailnet you want this connection to use. Your tailnet may require device approval.
 
