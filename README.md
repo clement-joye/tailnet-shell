@@ -30,7 +30,7 @@ Choose a short instance name. The installer automatically selects an unused priv
 sudo ./tailnet-shell install client \
   --dns-suffix example.ts.net
 
-client-tailscale up --accept-dns=false --hostname=mycomputer-client
+client-tailscale up --hostname=mycomputer-client
 client-tailscale status
 client-shell
 ```
@@ -49,7 +49,7 @@ For another instance, choose a different name; its subnet is allocated separatel
 
 ```bash
 sudo ./tailnet-shell install lab
-lab-tailscale up --accept-dns=false
+lab-tailscale up
 lab-shell
 ```
 
@@ -60,6 +60,8 @@ Installed scripts and services are independent of the repository's location. The
 Run `client-shell` in a Ghostty tab to enter that tailnet. Run `exit` to return to the surrounding shell. Child processes inherit the namespace; new tabs must enter it explicitly. The shell exports `TAILNET_NAMESPACE=client` for optional prompt customization and clears standard HTTP/SOCKS proxy variables.
 
 Use `client-tailscale` to inspect or configure the isolated daemon. Plain `tailscale` still targets the host daemon, even inside the isolated shell, because its Unix socket remains visible.
+
+The launcher supplies `--accept-dns=false` automatically for authentication (`up` or `login`) and preference changes (`set`). It rejects attempts to enable DNS acceptance, since this tool manages DNS separately. A plain `up` on an already configured instance first disables DNS acceptance with `set`, then runs `up` without flags to preserve other saved preferences. Help and read-only commands pass through without changing preferences. Existing installed launchers are not automatically updated by a repository change.
 
 The daemon starts at boot. If the default uplink changes, close all instance shells and restart its namespace service to refresh NAT and routing:
 

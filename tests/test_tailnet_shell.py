@@ -23,6 +23,69 @@ def options(name='client', subnet='10.203.80.0/30'):
 
 
 class TailnetShellTests(unittest.TestCase):
+    def launcher_calls(self, arguments, control_url='', fail_set=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / 'calls.jsonl'
+            sudo = root / 'sudo'
+            sudo.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+socket = next(i for i, arg in enumerate(args) if arg.startswith('--socket='))
+command = args[socket + 1:]
+with Path(os.environ['CALL_LOG']).open('a') as stream:
+    stream.write(json.dumps(command) + '\\n')
+if command == ['debug', 'prefs']:
+    print(json.dumps({'ControlURL': os.environ['CONTROL_URL']}))
+if command and command[0] == 'set' and os.environ['FAIL_SET'] == '1':
+    sys.exit(3)
+''')
+            sudo.chmod(0o755)
+            script = app.rendered_files(options())['/usr/local/bin/client-tailscale'][0]
+            env = dict(os.environ, PATH=f'{root}:' + os.environ['PATH'], CALL_LOG=str(log),
+                       CONTROL_URL=control_url, FAIL_SET='1' if fail_set else '0')
+            result = subprocess.run(['bash', '-s', '--', *arguments], input=script,
+                                    text=True, env=env, capture_output=True)
+            calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            return result, calls
+
+    def test_launcher_disables_dns_on_initial_up_login_and_set(self):
+        cases = [(['up'], [['debug', 'prefs'], ['up', '--accept-dns=false']]),
+                 (['up', '--hostname=my-client'], [['up', '--accept-dns=false', '--hostname=my-client']]),
+                 (['login'], [['login', '--accept-dns=false']]),
+                 (['set', '--accept-routes'], [['set', '--accept-dns=false', '--accept-routes']])]
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                result, calls = self.launcher_calls(arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls, expected)
+
+    def test_launcher_keeps_bare_up_and_stops_if_dns_change_fails(self):
+        result, calls = self.launcher_calls(['up'], control_url='https://controlplane.example')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [['debug', 'prefs'], ['set', '--accept-dns=false'], ['up']])
+        result, calls = self.launcher_calls(['up'], control_url='https://controlplane.example', fail_set=True)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(calls, [['debug', 'prefs'], ['set', '--accept-dns=false']])
+
+    def test_launcher_rejects_dns_enable_and_accepts_explicit_false(self):
+        for flag in ('--accept-dns', '--accept-dns=true', '-accept-dns=1'):
+            with self.subTest(flag=flag):
+                result, calls = self.launcher_calls(['up', flag])
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(calls, [])
+        result, calls = self.launcher_calls(['up', '--accept-dns=false'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [['up', '--accept-dns=false', '--accept-dns=false']])
+
+    def test_launcher_help_status_and_empty_set_do_not_change_preferences(self):
+        for arguments in (['up', '--help'], ['login', '-h'], ['set'], ['status', '--json']):
+            with self.subTest(arguments=arguments):
+                result, calls = self.launcher_calls(arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls, [arguments])
+
     def test_automatic_subnet_skips_ranges_and_allocates_distinct_links(self):
         occupied = [ipaddress.ip_network('10.203.0.0/24'),
                     ipaddress.ip_network('10.203.1.0/30'),

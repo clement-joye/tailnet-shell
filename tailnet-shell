@@ -201,7 +201,7 @@ def install(args):
         target.chmod(mode)
     run('systemctl', 'daemon-reload')
     run('systemctl', 'enable', '--now', f'tailnet-shell-{args.name}.service')
-    print(f'Installed. Authenticate with:\n  {args.name}-tailscale up --accept-dns=false --hostname={os.uname().nodename}-{args.name}')
+    print(f'Installed. Authenticate with:\n  {args.name}-tailscale up --hostname={os.uname().nodename}-{args.name}')
 
 
 def uninstall(args):
