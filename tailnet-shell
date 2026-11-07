@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Install and remove named Tailscale network namespaces on Linux."""
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -14,6 +16,7 @@ import sys
 
 SOURCE = Path(__file__).resolve().parent
 CONFIG = Path('/etc/tailnet-shell')
+SUBNET_POOLS = ('10.203.0.0/16', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')
 
 
 def run(*args, **kwargs):
@@ -94,6 +97,64 @@ def require_root():
         raise RuntimeError('Run this command with sudo.')
 
 
+@contextmanager
+def mutation_lock():
+    """Serialize allocation and removal across concurrent installer processes."""
+    require_root()
+    with open('/run/tailnet-shell.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def existing_subnets():
+    routes = json.loads(run('ip', '-j', '-4', 'route', 'show', 'table', 'all', capture_output=True).stdout)
+    networks = []
+    for route in routes:
+        destination = route.get('dst', 'default')
+        if destination != 'default':
+            subnet = ipaddress.ip_network(destination, strict=False)
+            if subnet.prefixlen:  # The default route does not reserve all addresses.
+                networks.append(subnet)
+    interfaces = json.loads(run('ip', '-j', '-4', 'address', 'show', capture_output=True).stdout)
+    for interface in interfaces:
+        for address in interface.get('addr_info', []):
+            if address.get('family') == 'inet':
+                networks.append(ipaddress.ip_network(f"{address['local']}/{address['prefixlen']}", strict=False))
+    for marker in CONFIG.glob('*/instance.json'):
+        networks.append(ipaddress.ip_network(json.loads(marker.read_text())['subnet']))
+    return networks
+
+
+def choose_subnet(existing):
+    """Find a free /30, jumping past occupied ranges instead of probing IPs."""
+    occupied = sorted((int(network.network_address), int(network.broadcast_address)) for network in existing)
+    for pool in SUBNET_POOLS:
+        network = ipaddress.ip_network(pool)
+        candidate = int(network.network_address)
+        limit = int(network.broadcast_address)
+        for start, end in occupied:
+            if end < candidate:
+                continue
+            if start > candidate + 3:
+                break
+            candidate = ((end + 1 + 3) // 4) * 4
+            if candidate + 3 > limit:
+                break
+        if candidate + 3 <= limit:
+            return str(ipaddress.ip_network((candidate, 30)))
+    raise RuntimeError('No unused private /30 subnet found. Review local routes and instance reservations.')
+
+
+def resolve_subnet(requested, existing):
+    if requested is None:
+        return choose_subnet(existing)
+    network = ipaddress.ip_network(requested)
+    for subnet in existing:
+        if network.overlaps(subnet):
+            raise RuntimeError(f'Subnet overlaps {subnet}; choose a different --subnet or omit it for automatic selection.')
+    return requested
+
+
 def ensure_no_shells(namespace):
     result = run('ip', 'netns', 'list', capture_output=True)
     if namespace not in [line.split()[0] for line in result.stdout.splitlines()]:
@@ -119,6 +180,7 @@ def install(args):
         raise RuntimeError('IPv4 forwarding is disabled. See README.md before enabling it.')
     if not Path('/dev/net/tun').exists():
         raise RuntimeError('/dev/net/tun is unavailable.')
+    args.subnet = resolve_subnet(args.subnet, existing_subnets())
     files = rendered_files(args)
     for path in files:
         if os.path.lexists(path):
@@ -126,14 +188,7 @@ def install(args):
     namespaces = run('ip', 'netns', 'list', capture_output=True).stdout
     if f'tn-{args.name}' in [line.split()[0] for line in namespaces.splitlines()]:
         raise RuntimeError('Namespace already exists.')
-    requested = ipaddress.ip_network(args.subnet)
-    routes = json.loads(run('ip', '-j', '-4', 'route', 'show', 'table', 'all', capture_output=True).stdout)
-    existing = [r['dst'] for r in routes if r.get('dst', 'default') != 'default']
-    for marker in CONFIG.glob('*/instance.json'):
-        existing.append(json.loads(marker.read_text())['subnet'])
-    for subnet in existing:
-        if requested.overlaps(ipaddress.ip_network(subnet, strict=False)):
-            raise RuntimeError(f'Subnet overlaps {subnet}; choose a different --subnet.')
+    print(f'Using subnet {args.subnet}', flush=True)
     state = Path(f'/var/lib/tailnet-shell/{args.name}')
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     state.chmod(0o700)
@@ -239,7 +294,8 @@ def main():
     for command in ('install', 'render'):
         item = sub.add_parser(command, help='Install an instance' if command == 'install' else 'Preview generated files without root or network changes')
         item.add_argument('name', type=name_type)
-        item.add_argument('--subnet', type=subnet_type, required=True)
+        item.add_argument('--subnet', type=subnet_type, required=command == 'render',
+                          help='Private IPv4 /30; install automatically selects an unused subnet if omitted')
         item.add_argument('--dns-suffix', type=suffix_type)
         item.add_argument('--bootstrap-dns', type=dns_type, nargs='+', default=['1.1.1.1', '9.9.9.9'])
         if command == 'render':
@@ -252,12 +308,9 @@ def main():
     item.add_argument('--purge-state', action='store_true')
     args = parser.parse_args()
     try:
-        if args.command == 'install':
-            install(args)
-        elif args.command == 'uninstall':
-            uninstall(args)
-        elif args.command == 'uninstall-legacy':
-            uninstall_legacy(args)
+        if args.command in ('install', 'uninstall', 'uninstall-legacy'):
+            with mutation_lock():
+                {'install': install, 'uninstall': uninstall, 'uninstall-legacy': uninstall_legacy}[args.command](args)
         else:
             for path, (content, mode) in rendered_files(args).items():
                 target = args.output / path.lstrip('/')

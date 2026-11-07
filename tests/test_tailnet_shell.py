@@ -1,6 +1,8 @@
 import argparse
 import importlib.machinery
 import importlib.util
+import ipaddress
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -21,6 +23,52 @@ def options(name='client', subnet='10.203.80.0/30'):
 
 
 class TailnetShellTests(unittest.TestCase):
+    def test_automatic_subnet_skips_ranges_and_allocates_distinct_links(self):
+        occupied = [ipaddress.ip_network('10.203.0.0/24'),
+                    ipaddress.ip_network('10.203.1.0/30'),
+                    ipaddress.ip_network('10.203.1.6/32')]
+        first = app.choose_subnet(occupied)
+        self.assertEqual(first, '10.203.1.8/30')
+        occupied.append(ipaddress.ip_network(first))
+        second = app.choose_subnet(occupied)
+        self.assertEqual(second, '10.203.1.12/30')
+        self.assertTrue(all(not ipaddress.ip_network(second).overlaps(net) for net in occupied))
+
+    def test_automatic_subnet_falls_back_and_reports_exhaustion(self):
+        occupied = [ipaddress.ip_network('10.0.0.0/8')]
+        self.assertEqual(app.choose_subnet(occupied), '172.16.0.0/30')
+        occupied.append(ipaddress.ip_network('172.16.0.0/12'))
+        self.assertEqual(app.choose_subnet(occupied), '192.168.0.0/30')
+        occupied.append(ipaddress.ip_network('192.168.0.0/16'))
+        with self.assertRaisesRegex(RuntimeError, 'No unused private /30'):
+            app.choose_subnet(occupied)
+
+    def test_explicit_subnet_is_preserved_or_rejected_on_overlap(self):
+        existing = [ipaddress.ip_network('10.203.80.0/24')]
+        self.assertEqual(app.resolve_subnet('10.205.0.0/30', existing), '10.205.0.0/30')
+        with self.assertRaisesRegex(RuntimeError, 'Subnet overlaps'):
+            app.resolve_subnet('10.203.80.4/30', existing)
+
+    def test_allocation_checks_routes_interfaces_and_inactive_instances(self):
+        responses = [subprocess.CompletedProcess([], 0, json.dumps([
+            {'dst': 'default'}, {'dst': '0.0.0.0/0'}, {'dst': '10.203.0.0/24'}])),
+            subprocess.CompletedProcess([], 0, json.dumps([{'addr_info': [
+                {'family': 'inet', 'local': '10.203.1.1', 'prefixlen': 30}]}]))]
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            (config / 'offline').mkdir()
+            (config / 'offline/instance.json').write_text(json.dumps({'subnet': '10.203.1.4/30'}))
+            with patch.object(app, 'CONFIG', config), patch.object(app, 'run', side_effect=responses):
+                self.assertEqual(app.choose_subnet(app.existing_subnets()), '10.203.1.8/30')
+
+    def test_install_cli_allows_omitting_subnet(self):
+        with patch('sys.argv', ['tailnet-shell', 'install', 'lab']), \
+                patch.object(app, 'mutation_lock'), patch.object(app, 'install') as install:
+            self.assertEqual(app.main(), 0)
+            args = install.call_args.args[0]
+            self.assertEqual(args.name, 'lab')
+            self.assertIsNone(args.subnet)
+
     def test_arguments_cannot_escape_paths_or_inject_shell(self):
         for name in ('../bad', 'x;id', 'Bad', 'a' * 13, '', '-bad', 'a\nwhoami'):
             with self.subTest(name=name), self.assertRaises(argparse.ArgumentTypeError):

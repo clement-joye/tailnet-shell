@@ -24,11 +24,10 @@ That forwarding setting affects the host globally; the installer never creates t
 
 ## Install an instance
 
-Choose a short name and an unused private IPv4 `/30` subnet. The installer rejects overlapping routes and subnets reserved by other managed instances.
+Choose a short instance name. The installer automatically selects an unused private IPv4 `/30` subnet and prints the selection.
 
 ```bash
 sudo ./tailnet-shell install client \
-  --subnet 10.203.80.0/30 \
   --dns-suffix example.ts.net
 
 client-tailscale up --accept-dns=false --hostname=mycomputer-client
@@ -36,16 +35,20 @@ client-tailscale status
 client-shell
 ```
 
+For the simplest setup, just run `sudo ./tailnet-shell install client`. Automatic selection checks IPv4 routes in all host routing tables, configured interface addresses, and subnets reserved by managed instances, including stopped instances. It tries `10.203.0.0/16` first, then the remaining available space in `10.0.0.0/8`, `172.16.0.0/12`, and `192.168.0.0/16`. The selected subnet is saved in the instance configuration and reused at boot. Concurrent installation and removal commands are serialized to prevent duplicate allocations.
+
+To choose a subnet yourself, supply `--subnet 10.203.80.0/30`. Explicit subnets receive the same overlap checks. Automatic selection cannot predict networks added later or remote networks that have not yet been installed as host routes.
+
 Authenticate using the account for the desired tailnet. This creates a separate device, subject to that tailnet's access and device approval policies. No state is copied from the host daemon.
 
 `--dns-suffix` is optional. Use the tailnet's actual MagicDNS suffix, available in `client-tailscale status --json` under `CurrentTailnet.MagicDNSSuffix`. Without it, use full DNS names or tailnet IP addresses. To add or change the suffix later, edit `/etc/tailnet-shell/client/resolv.shell`; newly opened shells use the change immediately.
 
 The daemon uses public bootstrap DNS (`1.1.1.1`, `9.9.9.9` by default). Override this with `--bootstrap-dns ADDRESS [ADDRESS ...]`. Pick resolvers reachable through the uplink; host loopback resolvers are unavailable inside the namespace. Shells use their own Tailscale resolver at `100.100.100.100`. A namespace-specific NSS configuration prevents glibc from falling back to the host's systemd-resolved service.
 
-For another instance, choose a different name and subnet:
+For another instance, choose a different name; its subnet is allocated separately:
 
 ```bash
-sudo ./tailnet-shell install lab --subnet 10.203.80.4/30
+sudo ./tailnet-shell install lab
 lab-tailscale up --accept-dns=false
 lab-shell
 ```
@@ -110,11 +113,11 @@ This provides network routing separation for terminal applications, not a securi
 
 ## Preview and validation
 
-Render installation files into a local directory without sudo or system changes:
+Render installation files into a local directory without sudo or system changes. Preview requires an explicit subnet so it does not need to inspect host networking:
 
 ```bash
 ./tailnet-shell render demo --subnet 10.203.84.0/30 --output .preview
 python3 -m unittest discover -s tests -v
 ```
 
-Tests validate input handling, generated shell syntax, separate instance resources, cleanup after partial startup, refusal to uninstall active shells, and validation of older installation layouts. Network commands in cleanup tests are mocked. The generic installer and removal commands require privileged integration testing; the earlier installation was confirmed working by its user.
+Tests validate subnet allocation and exhaustion, route/interface/instance reservations, manual overrides, input handling, generated shell syntax, separate instance resources, cleanup after partial startup, refusal to uninstall active shells, and validation of older installation layouts. Network commands in tests are mocked. The generic installer and removal commands require privileged integration testing; the earlier installation was confirmed working by its user.
