@@ -5,11 +5,13 @@
 ## Requirements
 
 - Linux with network namespaces, veth, and `/dev/net/tun`.
-- systemd, Python 3.9+, Bash, iproute2, iptables, Tailscale, sudo, util-linux (`runuser`, `mount`), and normal core utilities.
+- systemd, Python 3.9+, Bash, iproute2, iptables, conntrack, Tailscale, sudo, util-linux (`runuser`, `mount`), and normal core utilities.
 - Root access for installation, removal, and entering namespaces. Shells drop privileges to the invoking user.
 - An ordinary IPv4 default uplink and IPv4 forwarding enabled.
 
 Developed on Arch Linux with the iptables nft backend. Distribution-specific firewalls may need integration. This tool intentionally leaves the host Tailscale service and the global forwarding setting unchanged.
+
+The `conntrack` command is provided by `conntrack-tools` on Arch Linux (`sudo pacman -S conntrack-tools`) or `conntrack` on Debian/Ubuntu. It removes stale NAT mappings for the instance when its network interface changes; unrelated host connections are not removed.
 
 Check forwarding with `sysctl net.ipv4.ip_forward`. If disabled and you want to enable it persistently:
 
@@ -51,4 +53,4 @@ lab-tailscale up
 lab-shell
 ```
 
-Installed scripts and services are independent of the repository's location. The installer refuses to overwrite an existing installation; it is not an upgrade command. State retained by an earlier uninstall is reused when reinstalling the same name.
+Installed scripts and services are independent of the repository's location. The installer refuses to overwrite an existing installation; use [`upgrade NAME`](usage.md#upgrading-an-instance) to update an existing managed instance. State retained by an earlier uninstall is reused when reinstalling the same name.

@@ -132,6 +132,54 @@ if command and command[0] == 'set' and os.environ['FAIL_SET'] == '1':
             self.assertEqual(args.name, 'lab')
             self.assertIsNone(args.subnet)
 
+    def test_upgrade_preserves_configuration_and_stops_old_helper_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            base = config / 'client'
+            base.mkdir()
+            marker = base / 'instance.json'
+            metadata = json.dumps({'format': 1, 'name': 'client', 'subnet': '10.203.80.0/30',
+                                   'dns_suffix': 'example.ts.net', 'bootstrap_dns': ['9.9.9.9']})
+            marker.write_text(metadata)
+            helper = base / 'network.sh'
+            helper.write_text('old helper')
+            dns = base / 'resolv.shell'
+            dns.write_text('custom DNS')
+            watcher = config / 'units/client-uplink.service'
+            generated = {str(helper): ('new helper', 0o755), str(watcher): ('new unit', 0o644),
+                         str(dns): ('replace DNS', 0o644), str(marker): ('replace metadata', 0o644)}
+            calls = []
+
+            def command(*args):
+                if args[1] == 'stop':
+                    self.assertEqual(helper.read_text(), 'old helper')
+                if args[1] == 'start':
+                    self.assertEqual(helper.read_text(), 'new helper')
+                calls.append(args)
+
+            with patch.object(app, 'CONFIG', config), patch.object(app, 'require_root'), \
+                    patch.object(app, 'require_dependencies'), patch.object(app, 'ensure_no_shells'), \
+                    patch.object(app, 'rendered_files', return_value=generated) as render, \
+                    patch.object(app, 'run', side_effect=command), patch('builtins.print'):
+                app.upgrade(argparse.Namespace(name='client'))
+            self.assertEqual(marker.read_text(), metadata)
+            self.assertEqual(dns.read_text(), 'custom DNS')
+            self.assertEqual(watcher.read_text(), 'new unit')
+            self.assertEqual(helper.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(render.call_args.args[0].bootstrap_dns, ['9.9.9.9'])
+            self.assertEqual([call[1] for call in calls], ['stop', 'daemon-reload', 'start'])
+
+    def test_upgrade_refuses_active_shells_before_changes(self):
+        metadata = json.dumps({'format': 1, 'name': 'client', 'subnet': '10.203.80.0/30'})
+        with patch.object(app, 'require_root'), patch.object(app, 'require_dependencies'), \
+                patch.object(Path, 'read_text', return_value=metadata), \
+                patch.object(app, 'rendered_files', return_value={}), \
+                patch.object(app, 'ensure_no_shells', side_effect=RuntimeError('Exit all shells')), \
+                patch.object(app, 'run') as command:
+            with self.assertRaisesRegex(RuntimeError, 'Exit all shells'):
+                app.upgrade(argparse.Namespace(name='client'))
+            command.assert_not_called()
+
     def test_arguments_cannot_escape_paths_or_inject_shell(self):
         for name in ('../bad', 'x;id', 'Bad', 'a' * 13, '', '-bad', 'a\nwhoami'):
             with self.subTest(name=name), self.assertRaises(argparse.ArgumentTypeError):
@@ -155,6 +203,10 @@ if command and command[0] == 'set' and os.environ['FAIL_SET'] == '1':
         self.assertIn('10.203.80.1/30', network)
         self.assertIn('10.203.80.2/30', network)
         self.assertIn('-d 100.64.0.0/10 -j REJECT', network)
+        daemon = first['/etc/systemd/system/tailnet-shell-client.service'][0]
+        watcher = first['/etc/systemd/system/tailnet-shell-client-uplink.service'][0]
+        self.assertIn('tailnet-shell-client-uplink.service', daemon)
+        self.assertIn('PartOf=tailnet-shell-client-netns.service', watcher)
 
     def test_cleanup_is_idempotent_after_partial_start(self):
         # Exercise Bash control flow with every network command mocked.

@@ -8,7 +8,7 @@ Set up each connection once. After that, just run its shell command.
 
 ## Quick start
 
-You need Linux with systemd, Tailscale, Python 3.9+, iproute2, iptables, and sudo. IPv4 forwarding must be enabled. See [prerequisites and setup](docs/setup.md#requirements) for the full requirements and forwarding command. Developed on Arch Linux; other firewall configurations may need adjustments.
+You need Linux with systemd, Tailscale, Python 3.9+, iproute2, iptables, conntrack, and sudo. IPv4 forwarding must be enabled. See [prerequisites and setup](docs/setup.md#requirements) for the full requirements and forwarding command. Developed on Arch Linux; other firewall configurations may need adjustments.
 
 Clone the repository:
 
@@ -29,6 +29,8 @@ Your chosen name becomes the command prefix: if you install `work`, use `work-ta
 Open the login URL and sign in to the tailnet you want this connection to use. Your tailnet may require device approval.
 
 The installer chooses the local IP subnet automatically, configures separate DNS, and starts the connection at boot. The launcher handles `--accept-dns=false` for you.
+
+Using a host VPN such as Proton VPN? The connection follows the effective routed interface as the VPN connects or disconnects. See [VPN behavior and upgrading existing installations](docs/usage.md#vpns-and-changing-networks).
 
 ## Everyday use
 

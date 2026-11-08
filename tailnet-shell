@@ -13,10 +13,12 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 SOURCE = Path(__file__).resolve().parent
 CONFIG = Path('/etc/tailnet-shell')
 SUBNET_POOLS = ('10.203.0.0/16', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')
+DEPENDENCIES = ('ip', 'iptables', 'conntrack', 'tailscale', 'tailscaled', 'systemctl', 'runuser', 'mount', 'sudo', 'bash')
 
 
 def run(*args, **kwargs):
@@ -67,6 +69,7 @@ def rendered_files(args):
         'shell.sh': (f'/usr/local/bin/{args.name}-shell', 0o755),
         'tailscale.sh': (f'/usr/local/bin/{args.name}-tailscale', 0o755),
         'network.service': (f'/etc/systemd/system/tailnet-shell-{args.name}-netns.service', 0o644),
+        'uplink.service': (f'/etc/systemd/system/tailnet-shell-{args.name}-uplink.service', 0o644),
         'daemon.service': (f'/etc/systemd/system/tailnet-shell-{args.name}.service', 0o644),
     }
     for template, (path, mode) in templates.items():
@@ -171,11 +174,16 @@ def ensure_no_shells(namespace):
         raise RuntimeError(f'Exit all shells and stop applications in {namespace} first (PIDs: {", ".join(active)}).')
 
 
+def require_dependencies():
+    for tool in DEPENDENCIES:
+        if not shutil.which(tool):
+            hint = ' (install the conntrack-tools/conntrack package)' if tool == 'conntrack' else ''
+            raise RuntimeError(f'Missing dependency: {tool}{hint}')
+
+
 def install(args):
     require_root()
-    for tool in ('ip', 'iptables', 'tailscale', 'tailscaled', 'systemctl', 'runuser', 'mount', 'sudo', 'bash'):
-        if not shutil.which(tool):
-            raise RuntimeError(f'Missing dependency: {tool}')
+    require_dependencies()
     if Path('/proc/sys/net/ipv4/ip_forward').read_text().strip() != '1':
         raise RuntimeError('IPv4 forwarding is disabled. See README.md before enabling it.')
     if not Path('/dev/net/tun').exists():
@@ -204,6 +212,40 @@ def install(args):
     print(f'Installed. Authenticate with:\n  {args.name}-tailscale up --hostname={os.uname().nodename}-{args.name}')
 
 
+def upgrade(args):
+    require_root()
+    require_dependencies()
+    marker = CONFIG / args.name / 'instance.json'
+    metadata = json.loads(marker.read_text())
+    if metadata.get('format') != 1 or metadata.get('name') != args.name:
+        raise RuntimeError('Unrecognized instance metadata; refusing upgrade.')
+    settings = argparse.Namespace(name=args.name, subnet=subnet_type(metadata['subnet']),
+                                  dns_suffix=metadata.get('dns_suffix'),
+                                  bootstrap_dns=metadata.get('bootstrap_dns', ['1.1.1.1', '9.9.9.9']))
+    # Render before stopping anything, and retain all installed DNS and metadata.
+    generated = rendered_files(settings)
+    preserved = ('/instance.json', '/resolv.shell', '/resolv.conf', '/nsswitch.conf')
+    files = {path: value for path, value in generated.items() if not path.endswith(preserved)}
+    ensure_no_shells(f'tn-{args.name}')
+    run('systemctl', 'stop', f'tailnet-shell-{args.name}.service', f'tailnet-shell-{args.name}-netns.service')
+    # Stopping first lets the previously installed helper remove its own rules.
+    for path, (content, mode) in files.items():
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode='w', dir=target.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            try:
+                stream.write(content)
+                stream.flush()
+                temporary.chmod(mode)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'start', f'tailnet-shell-{args.name}.service')
+    print(f'Upgraded {args.name}; subnet, DNS configuration, and authentication state retained.')
+
+
 def uninstall(args):
     require_root()
     base = CONFIG / args.name
@@ -222,6 +264,7 @@ def uninstall(args):
     run('bash', str(base / 'network.sh'), 'stop')
     for path in (Path(f'/usr/local/bin/{args.name}-shell'), Path(f'/usr/local/bin/{args.name}-tailscale'),
                  Path(f'/etc/systemd/system/tailnet-shell-{args.name}.service'),
+                 Path(f'/etc/systemd/system/tailnet-shell-{args.name}-uplink.service'),
                  Path(f'/etc/systemd/system/tailnet-shell-{args.name}-netns.service')):
         path.unlink(missing_ok=True)
     shutil.rmtree(base)
@@ -303,14 +346,16 @@ def main():
     item = sub.add_parser('uninstall', help='Remove a named instance')
     item.add_argument('name', type=name_type)
     item.add_argument('--purge-state', action='store_true', help='Also delete local Tailscale authentication state')
+    item = sub.add_parser('upgrade', help='Update installed scripts and services while retaining configuration and login')
+    item.add_argument('name', type=name_type)
     item = sub.add_parser('uninstall-legacy', help='Remove a named instance created by the earlier installer layout')
     item.add_argument('name', type=name_type)
     item.add_argument('--purge-state', action='store_true')
     args = parser.parse_args()
     try:
-        if args.command in ('install', 'uninstall', 'uninstall-legacy'):
+        if args.command in ('install', 'upgrade', 'uninstall', 'uninstall-legacy'):
             with mutation_lock():
-                {'install': install, 'uninstall': uninstall, 'uninstall-legacy': uninstall_legacy}[args.command](args)
+                {'install': install, 'upgrade': upgrade, 'uninstall': uninstall, 'uninstall-legacy': uninstall_legacy}[args.command](args)
         else:
             for path, (content, mode) in rendered_files(args).items():
                 target = args.output / path.lstrip('/')

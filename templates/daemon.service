@@ -1,7 +1,8 @@
 [Unit]
 Description=Tailscale for isolated tailnet @NAME@
 Requires=tailnet-shell-@NAME@-netns.service
-After=tailnet-shell-@NAME@-netns.service
+Wants=tailnet-shell-@NAME@-uplink.service
+After=tailnet-shell-@NAME@-netns.service tailnet-shell-@NAME@-uplink.service
 PartOf=tailnet-shell-@NAME@-netns.service
 
 [Service]

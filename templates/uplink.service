@@ -1,0 +1,11 @@
+[Unit]
+Description=Follow policy-routed uplink for tailnet @NAME@
+Requires=tailnet-shell-@NAME@-netns.service
+After=tailnet-shell-@NAME@-netns.service
+PartOf=tailnet-shell-@NAME@-netns.service
+Before=tailnet-shell-@NAME@.service
+
+[Service]
+ExecStart=/etc/tailnet-shell/@NAME@/network.sh watch
+Restart=on-failure
+RestartSec=2
